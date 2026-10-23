@@ -1,0 +1,20 @@
+{
+  "name": "opencode-search",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local FTS5/BM25 content search over opencode v2 conversation databases",
+  "exports": {
+    ".": "./client/index.ts",
+    "./client": "./client/index.ts",
+    "./server": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.9.3"
+  }
+}
