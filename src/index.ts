@@ -1,21 +1,27 @@
 /**
  * opencode-search — a small local service that adds FTS5/BM25 content search
- * over opencode v2 conversation databases.
+ * over opencode v2 conversations.
  *
  * Each configured source database is opened READ-ONLY (WAL allows many
  * concurrent readers) and indexed into a private FTS5 database. One process
  * serves every source over a single loopback port, and each result carries the
  * source it came from.
  *
+ * opencode v2 stores conversations in `session_v2` and `session_message` (the
+ * `session`/`message`/`part` tables are the legacy v1 shape and are ignored).
+ * A message's `data` JSON is the unit of indexing: user text for user
+ * messages, and the text and tool errors inside `content[]` for assistant
+ * messages.
+ *
  * Sync strategy (per source):
- *   - initial backfill of all searchable parts
- *   - `max(part.time_updated)` on the source db as a cheap cross-process change
- *     detector; when it advances, index parts newer than the stored watermark
+ *   - initial backfill of all searchable messages
+ *   - `max(session_message.time_updated)` as a cheap cross-process change
+ *     detector; when it advances, index messages newer than the stored watermark
  *
  * Endpoints:
  *   GET /health
- *   GET /search?q=<query>&source=<name>&limit=<n>
- *   GET /sessions?source=<name>&limit=<n>&offset=<n>
+ *   GET /search?q=<query>&source=<name>&limit=<n>&directory=<path>
+ *   GET /sessions?source=<name>&limit=<n>&offset=<n>&directory=<path>
  *   GET /debug
  */
 
@@ -35,6 +41,9 @@ const ORIGINS = (process.env.SEARCH_ORIGINS ?? "")
   .map((value) => value.trim())
   .filter(Boolean)
 const POLL_MS = Number(process.env.SEARCH_POLL_MS ?? 1000)
+
+/** Bump when the index schema changes; the index is rebuilt on mismatch. */
+const SCHEMA_VERSION = 2
 
 /** A database to index: `name=path`, comma separated in `SEARCH_SOURCES`. */
 interface Source {
@@ -62,30 +71,25 @@ function parseSources(): Source[] {
 const SOURCES = parseSources()
 const sourceByName = new Map(SOURCES.map((source) => [source.name, source]))
 
-/** Message text, file references and tool errors — mirrors the server's recall search. */
-const TEXT_SQL = `CASE
-    WHEN json_extract(p.data, '$.type') = 'text' THEN coalesce(json_extract(p.data, '$.text'), '')
-    WHEN json_extract(p.data, '$.type') = 'file' THEN trim(
-      coalesce(json_extract(p.data, '$.filename'), '') || ' ' ||
-      CASE WHEN coalesce(json_extract(p.data, '$.url'), '') NOT LIKE 'data:%'
-        THEN coalesce(json_extract(p.data, '$.url'), '') ELSE '' END || ' ' ||
-      coalesce(json_extract(p.data, '$.source.path'), '') || ' ' ||
-      coalesce(json_extract(p.data, '$.source.name'), '') || ' ' ||
-      CASE WHEN coalesce(json_extract(p.data, '$.source.uri'), '') NOT LIKE 'data:%'
-        THEN coalesce(json_extract(p.data, '$.source.uri'), '') ELSE '' END || ' ' ||
-      coalesce(json_extract(p.data, '$.source.clientName'), '')
+/**
+ * The text to index for one `session_message` row. User messages carry `text`;
+ * assistant messages carry `content[]` parts, of which the text parts and any
+ * tool error messages are searchable. Reasoning is deliberately excluded.
+ */
+const TEXT_SQL = `CASE m.type
+    WHEN 'user' THEN coalesce(json_extract(m.data, '$.text'), '')
+    WHEN 'assistant' THEN trim(
+      coalesce((SELECT group_concat(json_extract(j.value, '$.text'), ' ')
+                FROM json_each(m.data, '$.content') j
+                WHERE json_extract(j.value, '$.type') = 'text'), '') || ' ' ||
+      coalesce((SELECT group_concat(
+                  coalesce(json_extract(j.value, '$.state.error.message'), json_extract(j.value, '$.state.error')), ' ')
+                FROM json_each(m.data, '$.content') j
+                WHERE json_extract(j.value, '$.type') = 'tool'
+                  AND json_extract(j.value, '$.state.status') = 'error'), '')
     )
-    ELSE coalesce(json_extract(p.data, '$.state.error'), '')
+    ELSE ''
   END`
-
-const PART_FILTER_SQL = `json_valid(p.data) AND (
-    (json_extract(p.data, '$.type') = 'text'
-      AND coalesce(json_extract(p.data, '$.synthetic'), 0) = 0
-      AND coalesce(json_extract(p.data, '$.ignored'), 0) = 0)
-    OR json_extract(p.data, '$.type') = 'file'
-    OR (json_extract(p.data, '$.type') = 'tool'
-      AND json_extract(p.data, '$.state.status') = 'error')
-  )`
 
 mkdirSync(join(SEARCH_DB, ".."), { recursive: true })
 
@@ -93,28 +97,45 @@ const index = new Database(SEARCH_DB, { create: true })
 
 index.run("PRAGMA journal_mode = WAL")
 index.run("PRAGMA synchronous = NORMAL")
+
+// The index is derived data: on a schema change, drop it and re-backfill.
+index.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);`)
+const storedSchema = Number(
+  index.query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'schema'").get()?.value ?? 0,
+)
+if (storedSchema !== SCHEMA_VERSION) {
+  index.exec(`
+    DROP TABLE IF EXISTS message_fts;
+    DROP TABLE IF EXISTS messages;
+    DROP TABLE IF EXISTS source_state;
+  `)
+  index.run("INSERT INTO meta(key, value) VALUES('schema', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [
+    String(SCHEMA_VERSION),
+  ])
+}
+
 index.exec(`
-  CREATE TABLE IF NOT EXISTS parts (
+  CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
     source TEXT NOT NULL,
-    part_id TEXT NOT NULL,
-    session_id TEXT,
+    message_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
     updated INTEGER,
     text TEXT,
-    UNIQUE(source, part_id)
+    UNIQUE(source, message_id)
   );
-  CREATE VIRTUAL TABLE IF NOT EXISTS part_fts USING fts5(
-    text, content='parts', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
+  CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
+    text, content='messages', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
   );
-  CREATE TRIGGER IF NOT EXISTS parts_ai AFTER INSERT ON parts BEGIN
-    INSERT INTO part_fts(rowid, text) VALUES (new.id, new.text);
+  CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO message_fts(rowid, text) VALUES (new.id, new.text);
   END;
-  CREATE TRIGGER IF NOT EXISTS parts_ad AFTER DELETE ON parts BEGIN
-    INSERT INTO part_fts(part_fts, rowid, text) VALUES ('delete', old.id, old.text);
+  CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO message_fts(message_fts, rowid, text) VALUES ('delete', old.id, old.text);
   END;
-  CREATE TRIGGER IF NOT EXISTS parts_au AFTER UPDATE ON parts BEGIN
-    INSERT INTO part_fts(part_fts, rowid, text) VALUES ('delete', old.id, old.text);
-    INSERT INTO part_fts(rowid, text) VALUES (new.id, new.text);
+  CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO message_fts(message_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO message_fts(rowid, text) VALUES (new.id, new.text);
   END;
   CREATE TABLE IF NOT EXISTS source_state (
     name TEXT PRIMARY KEY,
@@ -124,7 +145,7 @@ index.exec(`
 `)
 
 /** A source database is opened fresh per use: a long-lived read-only WAL
- *  connection can pin to an old snapshot, hiding newly committed parts. */
+ *  connection can pin to an old snapshot, hiding newly committed rows. */
 function withSource<T>(source: Source, fn: (db: Database) => T): T {
   const db = new Database(source.path, { readonly: true })
   try {
@@ -149,23 +170,23 @@ const setWatermark = (source: string, dbPath: string, value: number) =>
   )
 
 const upsert = index.prepare(
-  `INSERT INTO parts(source, part_id, session_id, updated, text) VALUES (?, ?, ?, ?, ?)
-   ON CONFLICT(source, part_id) DO UPDATE SET
+  `INSERT INTO messages(source, message_id, session_id, updated, text) VALUES (?, ?, ?, ?, ?)
+   ON CONFLICT(source, message_id) DO UPDATE SET
      session_id = excluded.session_id, updated = excluded.updated, text = excluded.text`,
 )
 
-/** Index all parts with time_updated > since (0 = full backfill), returning the new watermark. */
+/** Index all messages with time_updated > since (0 = full backfill), returning the new watermark. */
 function indexSince(db: Database, source: string, since: number): { indexed: number; watermark: number } {
   let watermark = since
   let indexed = 0
   const page = db.query<
-    { part_id: string; session_id: string; updated: number; text: string },
+    { message_id: string; session_id: string; updated: number; text: string },
     [number]
   >(
-    `SELECT p.id AS part_id, p.session_id AS session_id, p.time_updated AS updated, ${TEXT_SQL} AS text
-     FROM part p
-     WHERE ${PART_FILTER_SQL} AND p.time_updated > ? AND length(${TEXT_SQL}) > 0
-     ORDER BY p.time_updated, p.id
+    `SELECT m.id AS message_id, m.session_id AS session_id, m.time_updated AS updated, ${TEXT_SQL} AS text
+     FROM session_message m
+     WHERE m.type IN ('user', 'assistant') AND m.time_updated > ? AND length(${TEXT_SQL}) > 0
+     ORDER BY m.time_updated, m.id
      LIMIT 2000`,
   )
 
@@ -175,7 +196,7 @@ function indexSince(db: Database, source: string, since: number): { indexed: num
       if (rows.length === 0) break
       const tx = index.transaction((items: typeof rows) => {
         for (const row of items) {
-          upsert.run(source, row.part_id, row.session_id, row.updated, row.text)
+          upsert.run(source, row.message_id, row.session_id, row.updated, row.text)
           if (row.updated > watermark) watermark = row.updated
         }
       })
@@ -190,9 +211,9 @@ function indexSince(db: Database, source: string, since: number): { indexed: num
   return { indexed, watermark }
 }
 
-/** Newest part timestamp in a source db — the sync change signal. */
-function newestPartUpdated(db: Database): number {
-  const row = db.query<{ v: number | null }, []>("SELECT max(time_updated) AS v FROM part").get()
+/** Newest message timestamp in a source db — the sync change signal. */
+function newestMessageUpdated(db: Database): number {
+  const row = db.query<{ v: number | null }, []>("SELECT max(time_updated) AS v FROM session_message").get()
   return row?.v ?? 0
 }
 
@@ -203,14 +224,14 @@ let lastSync: Record<string, unknown> = {}
 function syncSource(source: Source, force = false) {
   const watermark = getWatermark(source.name)
   withSource(source, (db) => {
-    const newest = newestPartUpdated(db)
+    const newest = newestMessageUpdated(db)
     if (!force && newest <= watermark) return
     const { indexed, watermark: next } = indexSince(db, source.name, watermark)
-    // Advance past non-indexable parts too (reasoning, step markers, completed
-    // tools); parts written during the pass are > newest and caught next poll.
+    // Advance past non-indexable messages too (system, idle, switches); rows
+    // written during the pass are > newest and caught next poll.
     setWatermark(source.name, source.path, Math.max(next, newest))
     lastSync = { ...lastSync, [source.name]: { watermark, newest, indexed, next } }
-    if (indexed > 0) console.log(`[opencode-search] ${source.name}: indexed ${indexed} parts (watermark ${next})`)
+    if (indexed > 0) console.log(`[opencode-search] ${source.name}: indexed ${indexed} messages (watermark ${next})`)
   })
 }
 
@@ -219,17 +240,23 @@ function syncSource(source: Source, force = false) {
 type SessionMeta = { title: string; directory: string; updated: number }
 const sessionCaches = new Map<string, { at: number; map: Map<string, SessionMeta> }>()
 
+/** Root conversations (no subagents) of a source, keyed by session id. */
 function sessions(source: Source): Map<string, SessionMeta> {
   const cached = sessionCaches.get(source.name)
   if (cached && Date.now() - cached.at < 1000) return cached.map
   const rows = withSource(source, (db) =>
     db
-      .query<{ id: string; title: string; directory: string; time_updated: number }, []>(
-        "SELECT id, title, directory, time_updated FROM session",
+      .query<{ id: string; title: string | null; directory: string; time_updated: number }, []>(
+        "SELECT id, title, directory, time_updated FROM session_v2 WHERE parent_id IS NULL",
       )
       .all(),
   )
-  const map = new Map(rows.map((row) => [row.id, { title: row.title, directory: row.directory, updated: row.time_updated }]))
+  const map = new Map(
+    rows.map((row) => [
+      row.id,
+      { title: row.title ?? "", directory: row.directory, updated: row.time_updated },
+    ]),
+  )
   sessionCaches.set(source.name, { at: Date.now(), map })
   return map
 }
@@ -247,14 +274,14 @@ function resolveSource(name: string | null): Source | null {
 
 // ---- query ------------------------------------------------------------------
 
-type PartHit = { source: string; session_id: string; part_id: string; score: number; snippet: string }
+type MessageHit = { source: string; session_id: string; message_id: string; score: number; snippet: string }
 
-const searchStmt = index.query<PartHit, [string, string, number]>(
-  `SELECT p.source AS source, p.session_id AS session_id, p.part_id AS part_id,
-          bm25(part_fts) AS score,
-          snippet(part_fts, 0, '', '', ' … ', 14) AS snippet
-   FROM part_fts JOIN parts p ON p.id = part_fts.rowid
-   WHERE part_fts MATCH ? AND p.source = ?
+const searchStmt = index.query<MessageHit, [string, string, number]>(
+  `SELECT m.source AS source, m.session_id AS session_id, m.message_id AS message_id,
+          bm25(message_fts) AS score,
+          snippet(message_fts, 0, '', '', ' … ', 14) AS snippet
+   FROM message_fts JOIN messages m ON m.id = message_fts.rowid
+   WHERE message_fts MATCH ? AND m.source = ?
    ORDER BY score
    LIMIT ?`,
 )
@@ -283,14 +310,14 @@ export function search(query: string, source: Source, limit: number, directory?:
   if (hits.length === 0) hits = searchStmt.all(matchExpr(trimmed, "OR") ?? "", source.name, candidates)
 
   const meta = sessions(source)
-  const best = new Map<string, { score: number; snippet: string; partID: string }>()
+  const best = new Map<string, { score: number; snippet: string; messageID: string }>()
   for (const hit of hits) {
     const info = meta.get(hit.session_id)
-    if (!info) continue // deleted session
+    if (!info) continue // deleted session or subagent
     if (directory && info.directory !== directory) continue
     const current = best.get(hit.session_id)
     if (!current || hit.score < current.score)
-      best.set(hit.session_id, { score: hit.score, snippet: hit.snippet, partID: hit.part_id })
+      best.set(hit.session_id, { score: hit.score, snippet: hit.snippet, messageID: hit.message_id })
   }
 
   return [...best.entries()]
@@ -361,7 +388,7 @@ const server = Bun.serve({
           sources: SOURCES.map((source) => ({
             name: source.name,
             db: source.path,
-            parts: index.query<{ n: number }, [string]>("SELECT count(*) AS n FROM parts WHERE source = ?").get(source.name)?.n ?? 0,
+            parts: index.query<{ n: number }, [string]>("SELECT count(*) AS n FROM messages WHERE source = ?").get(source.name)?.n ?? 0,
             sessions: sessions(source).size,
             watermark: getWatermark(source.name),
           })),
@@ -405,7 +432,7 @@ const server = Bun.serve({
             name: source.name,
             db: source.path,
             watermark: getWatermark(source.name),
-            newest: withSource(source, (db) => newestPartUpdated(db)),
+            newest: withSource(source, (db) => newestMessageUpdated(db)),
           })),
         },
         req,

@@ -9,9 +9,9 @@ readers) and keeps its own FTS5 index in a separate database file. One process
 can index several sources and serves them all over a single loopback port; every
 result is tagged with the source it came from.
 
-> **Scope.** The service speaks the opencode v2 database shape (`part` / `session`
-> tables with `data` JSON). Kilo is a fork with the same shape, so a Kilo
-> database works too — point a source at it.
+> **Scope.** The service speaks the opencode v2 database shape: conversations
+> live in `session_v2` and `session_message`. The legacy `session` / `message` /
+> `part` tables are ignored.
 
 ## Run
 
@@ -79,12 +79,14 @@ export const search = createSearchClient({
 
 ## How sync works
 
-- On start (and whenever a source db's `max(part.time_updated)` advances) parts
-  with `time_updated` greater than the stored watermark are (re)indexed.
-- The watermark advances even past non-indexable parts (`reasoning`, step
-  markers, completed tools) so the scan window never grows.
+- On start (and whenever a source db's `max(session_message.time_updated)`
+  advances) messages with `time_updated` greater than the stored watermark are
+  (re)indexed.
+- The watermark advances even past non-indexable messages (`system`, `idle`,
+  model/agent switches) so the scan window never grows.
 - Deletions are not tracked; a deleted session simply disappears from results
   because session metadata is read live from the source db.
 
-The searchable text mirrors the server's own recall search: user/assistant
-text (excluding synthetic/ignored), file references and tool errors.
+The searchable text is a message's user text, or — for assistant messages — the
+text parts and tool error messages inside `content[]`. Reasoning is excluded.
+Only root conversations (no subagents) are listed.
