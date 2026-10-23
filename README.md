@@ -61,7 +61,7 @@ user is looking at. Without it, all directories are searched.
 
 `score` is FTS5 `bm25` — **more negative is better**. Results are aggregated to
 one row per session (its best-matching part) and only sessions that still exist
-are returned.
+and are not archived are returned.
 
 ## Client
 

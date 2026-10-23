@@ -240,14 +240,15 @@ function syncSource(source: Source, force = false) {
 type SessionMeta = { title: string; directory: string; updated: number }
 const sessionCaches = new Map<string, { at: number; map: Map<string, SessionMeta> }>()
 
-/** Root conversations (no subagents) of a source, keyed by session id. */
+/** Root conversations (no subagents) of a source, keyed by session id. Archived
+ *  conversations are excluded: they stay in the database but leave the lists. */
 function sessions(source: Source): Map<string, SessionMeta> {
   const cached = sessionCaches.get(source.name)
   if (cached && Date.now() - cached.at < 1000) return cached.map
   const rows = withSource(source, (db) =>
     db
       .query<{ id: string; title: string | null; directory: string; time_updated: number }, []>(
-        "SELECT id, title, directory, time_updated FROM session_v2 WHERE parent_id IS NULL",
+        "SELECT id, title, directory, time_updated FROM session_v2 WHERE parent_id IS NULL AND time_archived IS NULL",
       )
       .all(),
   )
