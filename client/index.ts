@@ -91,9 +91,9 @@ export function createSearchClient(options: SearchClientOptions) {
     }
   }
 
-  /** Query content search; throws if the service is unreachable or errors. */
-  async function searchContent(query: string, limit = 30): Promise<ContentHit[]> {
-    const data = await request<{ results?: ContentHit[] }>("/search", { q: query, limit }, 3000)
+  /** Query content search, optionally scoped to a project directory. */
+  async function searchContent(query: string, limit = 30, directory?: string): Promise<ContentHit[]> {
+    const data = await request<{ results?: ContentHit[] }>("/search", { q: query, limit, directory }, 3000)
     return data.results ?? []
   }
 
@@ -114,21 +114,30 @@ export function createSearchClient(options: SearchClientOptions) {
     return (await searchHealth(timeout)) != null
   }
 
-  /** One page of conversations (newest first) from the service. */
-  async function listSessionsPage(offset = 0, limit = 2000, timeout = 5000): Promise<SessionPage> {
-    const data = await request<{ total?: number; results?: ContentHit[] }>("/sessions", { limit, offset }, timeout)
+  /** One page of conversations (newest first), optionally scoped to a directory. */
+  async function listSessionsPage(
+    offset = 0,
+    limit = 2000,
+    timeout = 5000,
+    directory?: string,
+  ): Promise<SessionPage> {
+    const data = await request<{ total?: number; results?: ContentHit[] }>(
+      "/sessions",
+      { limit, offset, directory },
+      timeout,
+    )
     const results = data.results ?? []
     return { total: data.total ?? results.length, results }
   }
 
   /** List every conversation (newest first) by paging through the service. */
-  async function listAllSessions(pageSize = 2000): Promise<SessionPage> {
-    const first = await listSessionsPage(0, pageSize)
+  async function listAllSessions(pageSize = 2000, directory?: string): Promise<SessionPage> {
+    const first = await listSessionsPage(0, pageSize, 5000, directory)
     const results = [...first.results]
     while (results.length < first.total && first.results.length > 0) {
       let page: SessionPage
       try {
-        page = await listSessionsPage(results.length, pageSize)
+        page = await listSessionsPage(results.length, pageSize, 5000, directory)
       } catch {
         break // Service hiccup mid-way: keep what we already have.
       }

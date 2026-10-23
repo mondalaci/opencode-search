@@ -44,16 +44,20 @@ conversations.
 GET /health
   -> { ok, sources: [{ name, db, parts, sessions, watermark }] }
 
-GET /search?q=<terms>&source=<name>&limit=<1..50>
+GET /search?q=<terms>&source=<name>&limit=<1..50>&directory=<path>
   -> { results: [{ source, sessionID, title, directory, updated, score, snippet }] }
 
-GET /sessions?source=<name>&limit=<n>&offset=<n>
+GET /sessions?source=<name>&limit=<n>&offset=<n>&directory=<path>
   -> { source, total, results: [{ source, sessionID, title, directory, updated }] }
 
 GET /debug
 ```
 
 `source` may be omitted only when exactly one source is configured.
+
+`directory` optionally scopes `/search` and `/sessions` to one project directory
+(the session's `directory`), so a client can restrict results to the project the
+user is looking at. Without it, all directories are searched.
 
 `score` is FTS5 `bm25` — **more negative is better**. Results are aggregated to
 one row per session (its best-matching part) and only sessions that still exist

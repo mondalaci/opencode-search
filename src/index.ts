@@ -270,18 +270,24 @@ function matchExpr(query: string, op: "AND" | "OR"): string | null {
   return terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(` ${op} `)
 }
 
-export function search(query: string, source: Source, limit: number) {
+export function search(query: string, source: Source, limit: number, directory?: string) {
   const trimmed = query.trim()
   if (!trimmed) return []
 
+  // A directory scope can push a project's matches past a small candidate
+  // window, so widen it when filtering.
+  const candidates = directory ? 5000 : 2000
+
   // Prefer sessions matching every term; fall back to any term.
-  let hits = searchStmt.all(matchExpr(trimmed, "AND") ?? "", source.name, 2000)
-  if (hits.length === 0) hits = searchStmt.all(matchExpr(trimmed, "OR") ?? "", source.name, 2000)
+  let hits = searchStmt.all(matchExpr(trimmed, "AND") ?? "", source.name, candidates)
+  if (hits.length === 0) hits = searchStmt.all(matchExpr(trimmed, "OR") ?? "", source.name, candidates)
 
   const meta = sessions(source)
   const best = new Map<string, { score: number; snippet: string; partID: string }>()
   for (const hit of hits) {
-    if (!meta.has(hit.session_id)) continue // deleted session
+    const info = meta.get(hit.session_id)
+    if (!info) continue // deleted session
+    if (directory && info.directory !== directory) continue
     const current = best.get(hit.session_id)
     if (!current || hit.score < current.score)
       best.set(hit.session_id, { score: hit.score, snippet: hit.snippet, partID: hit.part_id })
@@ -367,9 +373,12 @@ const server = Bun.serve({
     if (url.pathname === "/sessions") {
       const source = resolveSource(url.searchParams.get("source"))
       if (!source) return json({ error: "unknown or ambiguous source" }, req, 400)
+      const directory = url.searchParams.get("directory") || undefined
       const limit = Math.min(50000, Math.max(1, Number(url.searchParams.get("limit") ?? 2000) || 2000))
       const offset = Math.max(0, Number(url.searchParams.get("offset") ?? 0) || 0)
-      const all = [...sessions(source).entries()].sort((a, b) => b[1].updated - a[1].updated)
+      const all = [...sessions(source).entries()]
+        .filter(([, meta]) => !directory || meta.directory === directory)
+        .sort((a, b) => b[1].updated - a[1].updated)
       return json(
         {
           source: source.name,
@@ -407,8 +416,9 @@ const server = Bun.serve({
       const source = resolveSource(url.searchParams.get("source"))
       if (!source) return json({ error: "unknown or ambiguous source" }, req, 400)
       const q = url.searchParams.get("q") ?? ""
+      const directory = url.searchParams.get("directory") || undefined
       const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") ?? 20) || 20))
-      return json({ results: search(q, source, limit) }, req)
+      return json({ results: search(q, source, limit, directory) }, req)
     }
 
     return json({ error: "not found" }, req, 404)
