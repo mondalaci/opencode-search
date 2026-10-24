@@ -13,6 +13,19 @@ result is tagged with the source it came from.
 > live in `session_v2` and `session_message`. The legacy `session` / `message` /
 > `part` tables are ignored.
 
+## Who uses it
+
+Two sibling repositories consume it through the `client/` entry point, each
+falling back to the opencode server's own title search when it is not running:
+
+- [opencode-web-chat](https://github.com/mondalaci/opencode-web-chat) — the web
+  chat UI, where it backs conversation content search.
+- [opencode-projects-studio](https://github.com/mondalaci/opencode-projects-studio)
+  — the Electron studio, which queries it the same way.
+
+Both declare it as a `file:` dependency, so each expects a checkout named
+`../opencode-search` next to it.
+
 ## Run
 
 ```bash
